@@ -1,15 +1,17 @@
 """FireSentinel Patagonia -- Streamlit dashboard entry point.
 
-Main application with sidebar navigation, filters, and page routing.
-Uses synchronous SQLAlchemy for Streamlit compatibility.
+Premium dark-themed fire monitoring dashboard with sidebar navigation,
+filters, and page routing. Uses synchronous SQLAlchemy for Streamlit
+compatibility.
 
 All user-facing text in SPANISH. Code and variable names in English.
 """
 
 from __future__ import annotations
 
-import os
-from datetime import date, datetime, timedelta
+import re
+from datetime import date, timedelta
+from typing import Any
 
 import streamlit as st
 
@@ -20,29 +22,99 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# CSS injection MUST be first after set_page_config
+from firesentinel.dashboard.theme import (  # noqa: E402
+    SEVERITY_LABELS_ES,
+    inject_css,
+    render_header,
+)
+
+inject_css()
+
+from streamlit_autorefresh import st_autorefresh  # noqa: E402
+
+from firesentinel.config import get_settings  # noqa: E402
 from firesentinel.dashboard.pages.admin import render_admin_page  # noqa: E402
 from firesentinel.dashboard.pages.detail import render_detail_page  # noqa: E402
 from firesentinel.dashboard.pages.map import render_map_page  # noqa: E402
+
+# Auto-refresh every 5 minutes
+st_autorefresh(interval=300_000, key="main_refresh")
+
+# ---------------------------------------------------------------------------
+# Session state initialization
+# ---------------------------------------------------------------------------
+
+if "page" not in st.session_state:
+    st.session_state["page"] = "map"
+if "selected_event" not in st.session_state:
+    st.session_state["selected_event"] = None
 
 # ---------------------------------------------------------------------------
 # Database connection
 # ---------------------------------------------------------------------------
 
-_DB_PATH = os.environ.get("DB_PATH", "./data/firesentinel.db")
+_PAGE_OPTIONS: dict[str, str] = {
+    "\U0001f5fa\ufe0f  Mapa de Incendios": "map",
+    "\U0001f50d  Detalle de Evento": "detail",
+    "\u2699\ufe0f  Administracion": "admin",
+}
+
+# Reverse lookup: page key -> display name
+_PAGE_DISPLAY: dict[str, str] = {v: k for k, v in _PAGE_OPTIONS.items()}
+
+# Severity mapping: Spanish label -> English key
+_SEVERITY_MAP: dict[str, str] = {v: k for k, v in SEVERITY_LABELS_ES.items()}
 
 
 @st.cache_resource
-def get_db_url() -> str:
-    """Create a synchronous SQLAlchemy database URL for the dashboard.
-
-    Streamlit does not support async engines natively, so we use a sync
-    SQLite connection string. The path is resolved from the DB_PATH
-    environment variable or defaults to ./data/firesentinel.db.
+def _get_db_url() -> str:
+    """Build a synchronous SQLAlchemy database URL from settings.
 
     Returns:
         SQLAlchemy database URL string (sync SQLite).
     """
-    return f"sqlite:///{_DB_PATH}"
+    settings = get_settings()
+    return f"sqlite:///{settings.db_path}"
+
+
+@st.cache_data(ttl=60)
+def _get_last_scan_info(_db_url: str) -> str:
+    """Fetch the last pipeline run timestamp for header display.
+
+    Args:
+        _db_url: Database URL string (underscore prefix for Streamlit caching).
+
+    Returns:
+        Formatted string with last scan info, or empty string if no runs.
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(_db_url)
+    try:
+        with engine.connect() as conn:
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT started_at, status FROM pipeline_runs "
+                        "ORDER BY started_at DESC LIMIT 1"
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if row:
+            started = row["started_at"]
+            if isinstance(started, str):
+                ts = started[:16].replace("T", " ")
+            else:
+                ts = started.strftime("%Y-%m-%d %H:%M")
+            return f"Ultimo escaneo: {ts} UTC"
+    except Exception:
+        pass
+    finally:
+        engine.dispose()
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -50,119 +122,176 @@ def get_db_url() -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_sidebar() -> dict:
-    """Render the sidebar with navigation and filters.
+def _render_sidebar(db_url: str) -> dict[str, Any]:
+    """Render the sidebar with logo, navigation, filters, and footer.
+
+    Args:
+        db_url: Database URL string for data queries.
 
     Returns:
-        Dict with filter values: page, date_from, date_to, severities,
+        Dict with filter values: date_from, date_to, severities,
         min_intent, provinces.
     """
     with st.sidebar:
-        st.title("\U0001f525 FireSentinel Patagonia")
-        st.caption("Deteccion de incendios e intencionalidad")
+        # ------------------------------------------------------------------
+        # Logo block
+        # ------------------------------------------------------------------
+        st.markdown(
+            """
+            <div style="display:flex;align-items:center;gap:12px;padding:8px 0 16px 0;">
+                <div style="
+                    width:40px;height:40px;
+                    background:linear-gradient(135deg, #FF3B30, #FF6B35, #FFBA08);
+                    border-radius:10px;
+                    display:flex;align-items:center;justify-content:center;
+                    box-shadow:0 4px 12px rgba(255,107,53,0.3);
+                    flex-shrink:0;
+                ">
+                    <span class="material-icons-round"
+                          style="font-size:22px;color:white;">
+                        local_fire_department
+                    </span>
+                </div>
+                <div>
+                    <span style="font-size:16px;font-weight:700;color:#F1F5F9;
+                        line-height:1.2;display:block;">FireSentinel</span>
+                    <span style="font-size:10px;color:#64748B;background:#1E293B;
+                        padding:1px 6px;border-radius:6px;font-weight:500;
+                        letter-spacing:0.03em;">v0.1.0</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        st.divider()
+        # ------------------------------------------------------------------
+        # Navigation section
+        # ------------------------------------------------------------------
+        st.markdown(
+            '<p style="font-size:10px;font-weight:600;color:#64748B;'
+            'text-transform:uppercase;letter-spacing:0.08em;margin:12px 0 6px 0;">'
+            "NAVEGACION</p>",
+            unsafe_allow_html=True,
+        )
 
-        # Navigation
-        st.subheader("Navegacion")
-        page_options = {
-            "Mapa": "map",
-            "Detalle de Evento": "detail",
-            "Panel Admin": "admin",
-        }
-
-        # Check if page was set programmatically (e.g. from table click)
         current_page = st.session_state.get("page", "map")
-
-        # Find display name for current page
-        current_display = "Mapa"
-        for display_name, page_key in page_options.items():
-            if page_key == current_page:
-                current_display = display_name
-                break
+        current_display = _PAGE_DISPLAY.get(current_page, _PAGE_DISPLAY["map"])
 
         selected_display = st.radio(
-            "Seccion",
-            options=list(page_options.keys()),
-            index=list(page_options.keys()).index(current_display),
+            "Navegacion",
+            options=list(_PAGE_OPTIONS.keys()),
+            index=list(_PAGE_OPTIONS.keys()).index(current_display),
             label_visibility="collapsed",
+            key="nav_radio",
         )
-        selected_page = page_options[selected_display]
+        selected_page = _PAGE_OPTIONS[selected_display]
         st.session_state["page"] = selected_page
 
-        st.divider()
+        # ------------------------------------------------------------------
+        # Filters section (only on map page)
+        # ------------------------------------------------------------------
+        filters: dict[str, Any] = {}
 
-        # Filters (visible on map page)
-        st.subheader("Filtros")
+        if selected_page == "map":
+            st.markdown(
+                '<p style="font-size:10px;font-weight:600;color:#64748B;'
+                "text-transform:uppercase;letter-spacing:0.08em;"
+                'margin:20px 0 6px 0;">FILTROS</p>',
+                unsafe_allow_html=True,
+            )
 
-        # Date range
-        default_end = date.today()
-        default_start = default_end - timedelta(days=7)
+            # Date range
+            default_end = date.today()
+            default_start = default_end - timedelta(days=7)
 
-        date_from = st.date_input(
-            "Fecha desde",
-            value=default_start,
-            key="filter_date_from",
-        )
-        date_to = st.date_input(
-            "Fecha hasta",
-            value=default_end,
-            key="filter_date_to",
-        )
+            date_range = st.date_input(
+                "Rango de fechas",
+                value=(default_start, default_end),
+                key="filter_date_range",
+            )
 
-        # Severity filter
-        severity_options = {
-            "Baja": "low",
-            "Media": "medium",
-            "Alta": "high",
-            "Critica": "critical",
-        }
-        selected_severities_display = st.multiselect(
-            "Severidad",
-            options=list(severity_options.keys()),
-            default=list(severity_options.keys()),
-            key="filter_severities",
-        )
-        selected_severities = [severity_options[s] for s in selected_severities_display]
+            # Parse date_input result (can be tuple or single date)
+            if isinstance(date_range, list | tuple) and len(date_range) == 2:
+                date_from, date_to = date_range
+            elif isinstance(date_range, list | tuple):
+                date_from = date_range[0]
+                date_to = default_end
+            else:
+                date_from = date_range
+                date_to = default_end
 
-        # Intentionality threshold
-        min_intent = st.slider(
-            "Intencionalidad minima",
-            min_value=0,
-            max_value=100,
-            value=0,
-            step=5,
-            help=(
-                "Mostrar solo eventos con puntaje de intencionalidad "
-                "igual o superior a este valor. 0 = mostrar todos."
-            ),
-            key="filter_min_intent",
-        )
+            # Severity filter (Spanish labels -> English keys internally)
+            severity_labels_es = list(SEVERITY_LABELS_ES.values())
+            selected_severity_labels = st.multiselect(
+                "Severidad",
+                options=severity_labels_es,
+                default=severity_labels_es,
+                key="filter_severities",
+            )
+            selected_severities = [
+                _SEVERITY_MAP[label]
+                for label in selected_severity_labels
+                if label in _SEVERITY_MAP
+            ]
 
-        # Province filter
-        province_options = ["Chubut", "Rio Negro", "Neuquen", "Santa Cruz"]
-        selected_provinces = st.multiselect(
-            "Provincia",
-            options=province_options,
-            default=province_options,
-            key="filter_provinces",
-        )
+            # Intentionality threshold
+            min_intent = st.slider(
+                "Intencionalidad minima",
+                min_value=0,
+                max_value=100,
+                value=0,
+                step=5,
+                help=(
+                    "Mostrar solo eventos con puntaje de intencionalidad "
+                    "igual o superior a este valor. 0 = mostrar todos."
+                ),
+                key="filter_min_intent",
+            )
 
-        st.divider()
+            # Province filter
+            province_options = [
+                "Chubut",
+                "Rio Negro",
+                "Neuquen",
+                "Santa Cruz",
+                "Tierra del Fuego",
+            ]
+            selected_provinces = st.multiselect(
+                "Provincia",
+                options=province_options,
+                default=province_options,
+                key="filter_provinces",
+            )
 
+            filters = {
+                "date_from": str(date_from),
+                "date_to": str(date_to),
+                "severities": selected_severities,
+                "min_intent": min_intent,
+                "provinces": selected_provinces,
+            }
+
+        # ------------------------------------------------------------------
         # Footer
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        st.caption(f"Datos: NASA FIRMS | Ultima actualizacion: {now_str}")
-        st.caption("FireSentinel Patagonia v0.1.0")
+        # ------------------------------------------------------------------
+        env_label = get_settings().environment.upper()
+        st.markdown(
+            f"""
+            <div style="position:absolute;bottom:20px;left:16px;right:16px;">
+                <div style="border-top:1px solid #1E293B;padding-top:12px;">
+                    <p style="font-size:10px;color:#64748B;margin:0 0 2px 0;">
+                        Datos: NASA FIRMS / MODIS + VIIRS</p>
+                    <p style="font-size:10px;color:#64748B;margin:0 0 2px 0;">
+                        FireSentinel Patagonia v0.1.0</p>
+                    <p style="font-size:10px;color:#475569;margin:0;">
+                        Entorno: {env_label}</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    return {
-        "page": selected_page,
-        "date_from": str(date_from),
-        "date_to": str(date_to),
-        "severities": selected_severities,
-        "min_intent": min_intent,
-        "provinces": selected_provinces,
-    }
+    return filters
 
 
 # ---------------------------------------------------------------------------
@@ -171,27 +300,41 @@ def render_sidebar() -> dict:
 
 
 def main() -> None:
-    """Main dashboard entry point. Routes to the selected page."""
-    db_url = get_db_url()
-    filters = render_sidebar()
+    """Main dashboard entry point. Renders header, sidebar, and routes pages."""
+    db_url = _get_db_url()
 
+    # Header with last scan info
+    last_scan = _get_last_scan_info(_db_url=db_url)
+    render_header(last_scan_text=last_scan)
+
+    # Sidebar navigation and filters
+    filters = _render_sidebar(db_url)
+
+    # Page routing
     page = st.session_state.get("page", "map")
 
     if page == "map":
-        render_map_page(db_url=db_url, filters=filters)
+        render_map_page(filters=filters)
 
     elif page == "detail":
-        event_id = st.session_state.get("selected_event_id")
-
-        # Also check URL query params
+        # Check URL query params for event_id override
         params = st.query_params
         if "event_id" in params:
-            event_id = params["event_id"]
+            eid = str(params["event_id"])
+            # Only accept valid UUIDs to prevent XSS
+            if re.match(r"^[0-9a-fA-F-]{36}$", eid):
+                st.session_state["selected_event"] = eid
 
-        render_detail_page(db_url=db_url, event_id=event_id)
+        if st.session_state.get("selected_event") is None:
+            # No event selected -- redirect to map
+            st.session_state["page"] = "map"
+            st.info("No hay evento seleccionado. Seleccione un evento desde el mapa.")
+            render_map_page(filters=filters)
+        else:
+            render_detail_page()
 
     elif page == "admin":
-        render_admin_page(db_url=db_url, db_path=_DB_PATH)
+        render_admin_page()
 
 
 if __name__ == "__main__":

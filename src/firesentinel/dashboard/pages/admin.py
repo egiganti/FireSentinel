@@ -1,31 +1,53 @@
 """Admin panel page -- password-protected system health dashboard.
 
-Shows pipeline health, API status, alert stats, and system information.
-All user-facing text in SPANISH.
+Premium dark-themed admin panel with pipeline health, API status,
+alert statistics, and system information. Uses synchronous SQLAlchemy
+and the FireSentinel design system theme components.
+
+All user-facing text in SPANISH. Code and variable names in English.
 """
 
 from __future__ import annotations
 
-import os
+import hmac
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, text
 
-from firesentinel.db.models import AlertSent, AlertSubscription, FireEvent, Hotspot, PipelineRun
+from firesentinel.config import get_settings
+from firesentinel.dashboard.theme import (
+    COLORS,
+    render_card_container,
+    render_kpi_row,
+    render_metric_card,
+    render_section_header,
+)
 
 # ---------------------------------------------------------------------------
-# Pipeline status display maps
+# Status mapping
 # ---------------------------------------------------------------------------
 
-_STATUS_COLORS: dict[str, str] = {
-    "success": "\U0001f7e2",
-    "partial": "\U0001f7e1",
-    "failed": "\U0001f534",
+_STATUS_MAP: dict[str, str] = {
+    "success": "online",
+    "partial": "warning",
+    "failed": "error",
+}
+
+_STATUS_LABELS_ES: dict[str, str] = {
+    "success": "Exitoso",
+    "partial": "Parcial",
+    "failed": "Fallido",
+}
+
+_API_ICONS: dict[str, str] = {
+    "FIRMS": "satellite_alt",
+    "Open-Meteo": "thermostat",
+    "Overpass": "map",
 }
 
 
@@ -34,115 +56,201 @@ _STATUS_COLORS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _check_admin_auth() -> bool:
-    """Check if the user is authenticated as admin.
-
-    Uses ADMIN_PASSWORD env var for password verification and
-    Streamlit session state to persist auth status.
+def _render_login_form() -> bool:
+    """Render the styled admin login form.
 
     Returns:
-        True if authenticated, False otherwise.
+        True if the user is authenticated, False otherwise.
     """
     if st.session_state.get("admin_authenticated", False):
         return True
 
-    admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    settings = get_settings()
+    admin_password = settings.admin_password
 
     if not admin_password:
-        st.warning(
-            "La variable de entorno ADMIN_PASSWORD no esta configurada. "
-            "El panel de administracion no esta disponible."
+        st.markdown(
+            """
+            <div style="display:flex;justify-content:center;padding:80px 0;">
+                <div style="
+                    background:rgba(30,41,59,0.5);
+                    backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+                    border:1px solid rgba(255,255,255,0.08);
+                    border-radius:16px;padding:40px;
+                    max-width:400px;width:100%;text-align:center;
+                ">
+                    <span class="material-icons-round"
+                          style="font-size:48px;color:#EF4444;margin-bottom:16px;display:block;">
+                        error
+                    </span>
+                    <h3 style="font-size:18px;font-weight:700;color:#F1F5F9;margin:0 0 8px 0;">
+                        Panel no disponible</h3>
+                    <p style="font-size:13px;color:#94A3B8;margin:0;">
+                        La variable ADMIN_PASSWORD no esta configurada.
+                        Contacte al administrador del sistema.</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
         return False
 
-    st.subheader("Acceso al panel de administracion")
-    password = st.text_input("Contrasena", type="password", key="admin_password_input")
+    # Centered login card
+    st.markdown(
+        """
+        <div style="display:flex;justify-content:center;padding:60px 0 20px 0;">
+            <div style="
+                background:rgba(30,41,59,0.5);
+                backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+                border:1px solid rgba(255,255,255,0.08);
+                border-radius:16px;padding:40px 36px 28px 36px;
+                max-width:380px;width:100%;text-align:center;
+            ">
+                <span class="material-icons-round"
+                      style="font-size:44px;color:#FF6B35;margin-bottom:12px;display:block;">
+                    lock
+                </span>
+                <h3 style="font-size:20px;font-weight:700;color:#F1F5F9;margin:0 0 4px 0;">
+                    Panel de Administracion</h3>
+                <p style="font-size:13px;color:#94A3B8;margin:0 0 24px 0;">
+                    Ingrese la contrasena de administrador</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if st.button("Ingresar"):
-        if password == admin_password:
-            st.session_state["admin_authenticated"] = True
-            st.rerun()
-        else:
-            st.error("Contrasena incorrecta.")
+    # Password input and button (centered with columns)
+    _left, center, _right = st.columns([1, 2, 1])
+    with center:
+        password = st.text_input(
+            "Contrasena",
+            type="password",
+            key="admin_password_input",
+            label_visibility="collapsed",
+            placeholder="Contrasena de administrador",
+        )
+
+        # Rate limiting: track failed attempts
+        if "auth_failures" not in st.session_state:
+            st.session_state["auth_failures"] = 0
+            st.session_state["auth_lockout_until"] = 0.0
+
+        locked_out = time.time() < st.session_state["auth_lockout_until"]
+        if locked_out:
+            remaining = int(st.session_state["auth_lockout_until"] - time.time())
+            st.warning(f"Demasiados intentos. Espere {remaining}s.")
+
+        if st.button("Ingresar", use_container_width=True, type="primary", disabled=locked_out):
+            # Timing-safe comparison to prevent timing attacks
+            if hmac.compare_digest(password, admin_password):
+                st.session_state["admin_authenticated"] = True
+                st.session_state["auth_failures"] = 0
+                st.rerun()
+            else:
+                st.session_state["auth_failures"] += 1
+                failures = st.session_state["auth_failures"]
+                if failures >= 5:
+                    # Lock out for 5 minutes after 5 failures
+                    st.session_state["auth_lockout_until"] = time.time() + 300
+                    st.error("Demasiados intentos fallidos. Bloqueado por 5 minutos.")
+                else:
+                    st.error(f"Contrasena incorrecta. Intento {failures}/5.")
 
     return False
 
 
 # ---------------------------------------------------------------------------
-# Data queries
+# Data queries (cached)
 # ---------------------------------------------------------------------------
 
 
 @st.cache_data(ttl=300)
-def get_pipeline_runs(_db_url: str, limit: int = 20) -> list[dict[str, Any]]:
-    """Fetch recent pipeline runs.
+def _get_pipeline_runs(_db_url: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Fetch recent pipeline runs from the database.
 
     Args:
-        _db_url: Database URL string.
-        limit: Number of runs to fetch.
+        _db_url: Database URL string (underscore prefix for Streamlit caching).
+        limit: Maximum number of runs to return.
 
     Returns:
-        List of pipeline run dicts sorted by most recent first.
+        List of pipeline run dicts, most recent first.
     """
-    from sqlalchemy import create_engine
-
     engine = create_engine(_db_url)
     results: list[dict[str, Any]] = []
 
-    with Session(engine) as session:
-        query = select(PipelineRun).order_by(PipelineRun.started_at.desc()).limit(limit)
-        rows = session.execute(query).scalars().all()
+    try:
+        with engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT started_at, completed_at, status, hotspots_fetched, "
+                        "new_hotspots, events_created, events_updated, alerts_sent, "
+                        "errors, duration_ms "
+                        "FROM pipeline_runs ORDER BY started_at DESC LIMIT :limit"
+                    ),
+                    {"limit": limit},
+                )
+                .mappings()
+                .all()
+            )
 
-        for run in rows:
-            errors_data = run.errors
+        for row in rows:
+            # Parse errors field
+            errors_raw = row["errors"]
             error_list: list[str] = []
-            if isinstance(errors_data, list):
-                error_list = errors_data
-            elif isinstance(errors_data, dict):
-                error_list = errors_data.get("errors", [])
+            if isinstance(errors_raw, list):
+                error_list = errors_raw
+            elif isinstance(errors_raw, dict):
+                error_list = errors_raw.get("errors", [])
+            elif isinstance(errors_raw, str):
+                import json
+
+                try:
+                    parsed = json.loads(errors_raw)
+                    if isinstance(parsed, list):
+                        error_list = parsed
+                    elif isinstance(parsed, dict):
+                        error_list = parsed.get("errors", [])
+                except (json.JSONDecodeError, TypeError):
+                    error_list = [errors_raw] if errors_raw else []
 
             results.append(
                 {
-                    "id": run.id,
-                    "started_at": run.started_at.strftime("%Y-%m-%d %H:%M")
-                    if run.started_at
-                    else "N/A",
-                    "completed_at": run.completed_at.strftime("%Y-%m-%d %H:%M")
-                    if run.completed_at
-                    else "N/A",
-                    "status": run.status,
-                    "duration_ms": run.duration_ms,
-                    "hotspots_fetched": run.hotspots_fetched,
-                    "new_hotspots": run.new_hotspots,
-                    "events_created": run.events_created,
-                    "events_updated": run.events_updated,
-                    "alerts_sent": run.alerts_sent,
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                    "status": row["status"] or "unknown",
+                    "hotspots_fetched": row["hotspots_fetched"] or 0,
+                    "new_hotspots": row["new_hotspots"] or 0,
+                    "events_created": row["events_created"] or 0,
+                    "events_updated": row["events_updated"] or 0,
+                    "alerts_sent": row["alerts_sent"] or 0,
                     "errors": error_list,
+                    "duration_ms": row["duration_ms"],
                 }
             )
+    except Exception:
+        pass
+    finally:
+        engine.dispose()
 
-    engine.dispose()
     return results
 
 
 @st.cache_data(ttl=300)
-def get_alert_stats(_db_url: str) -> dict[str, Any]:
+def _get_alert_stats(_db_url: str) -> dict[str, Any]:
     """Fetch alert statistics for the admin panel.
 
     Args:
         _db_url: Database URL string.
 
     Returns:
-        Dict with alert stats: total_24h, total_7d, by_channel, success_rate,
-        active_subscriptions.
+        Dict with keys: total_24h, total_7d, success_rate, active_subscriptions.
     """
-    from sqlalchemy import create_engine
-
     engine = create_engine(_db_url)
     stats: dict[str, Any] = {
         "total_24h": 0,
         "total_7d": 0,
-        "by_channel": {},
         "success_rate": 0.0,
         "active_subscriptions": 0,
     }
@@ -151,281 +259,412 @@ def get_alert_stats(_db_url: str) -> dict[str, Any]:
     day_ago = now - timedelta(hours=24)
     week_ago = now - timedelta(days=7)
 
-    with Session(engine) as session:
-        # Alerts last 24h
-        count_24h = session.execute(
-            select(func.count(AlertSent.id)).where(AlertSent.sent_at >= day_ago)
-        ).scalar_one_or_none()
-        stats["total_24h"] = count_24h or 0
-
-        # Alerts last 7d
-        count_7d = session.execute(
-            select(func.count(AlertSent.id)).where(AlertSent.sent_at >= week_ago)
-        ).scalar_one_or_none()
-        stats["total_7d"] = count_7d or 0
-
-        # By channel (last 7d)
-        channel_rows = session.execute(
-            select(AlertSent.channel, func.count(AlertSent.id))
-            .where(AlertSent.sent_at >= week_ago)
-            .group_by(AlertSent.channel)
-        ).all()
-        stats["by_channel"] = {row[0]: row[1] for row in channel_rows}
-
-        # Delivery success rate (last 7d)
-        total_sent = stats["total_7d"]
-        if total_sent > 0:
-            delivered_count = session.execute(
-                select(func.count(AlertSent.id)).where(
-                    AlertSent.sent_at >= week_ago,
-                    AlertSent.delivered.is_(True),
+    try:
+        with engine.connect() as conn:
+            # Alerts in last 24h
+            row_24h = (
+                conn.execute(
+                    text("SELECT COUNT(*) AS cnt FROM alerts_sent WHERE sent_at >= :since"),
+                    {"since": day_ago.isoformat()},
                 )
-            ).scalar_one_or_none()
-            stats["success_rate"] = ((delivered_count or 0) / total_sent) * 100
+                .mappings()
+                .first()
+            )
+            stats["total_24h"] = row_24h["cnt"] if row_24h else 0
 
-        # Active subscriptions
-        active_subs = session.execute(
-            select(func.count(AlertSubscription.id)).where(AlertSubscription.is_active.is_(True))
-        ).scalar_one_or_none()
-        stats["active_subscriptions"] = active_subs or 0
+            # Alerts in last 7d
+            row_7d = (
+                conn.execute(
+                    text("SELECT COUNT(*) AS cnt FROM alerts_sent WHERE sent_at >= :since"),
+                    {"since": week_ago.isoformat()},
+                )
+                .mappings()
+                .first()
+            )
+            stats["total_7d"] = row_7d["cnt"] if row_7d else 0
 
-    engine.dispose()
+            # Delivery success rate (last 7d)
+            total_sent = stats["total_7d"]
+            if total_sent > 0:
+                row_delivered = (
+                    conn.execute(
+                        text(
+                            "SELECT COUNT(*) AS cnt FROM alerts_sent "
+                            "WHERE sent_at >= :since AND delivered = 1"
+                        ),
+                        {"since": week_ago.isoformat()},
+                    )
+                    .mappings()
+                    .first()
+                )
+                delivered = row_delivered["cnt"] if row_delivered else 0
+                stats["success_rate"] = (delivered / total_sent) * 100
+
+            # Active subscriptions
+            row_subs = (
+                conn.execute(
+                    text("SELECT COUNT(*) AS cnt FROM alert_subscriptions WHERE is_active = 1")
+                )
+                .mappings()
+                .first()
+            )
+            stats["active_subscriptions"] = row_subs["cnt"] if row_subs else 0
+
+    except Exception:
+        pass
+    finally:
+        engine.dispose()
+
     return stats
 
 
 @st.cache_data(ttl=300)
-def get_system_info(_db_url: str, db_path: str) -> dict[str, Any]:
+def _get_system_info(_db_url: str, _db_path: str) -> dict[str, Any]:
     """Fetch system information for the admin panel.
 
     Args:
         _db_url: Database URL string.
-        db_path: Path to the SQLite database file.
+        _db_path: Path to the SQLite database file.
 
     Returns:
-        Dict with system info: db_size_mb, total_hotspots, total_events,
+        Dict with keys: db_size_mb, total_hotspots, total_events,
         active_events, environment.
     """
-    from sqlalchemy import create_engine
-
+    settings = get_settings()
     engine = create_engine(_db_url)
     info: dict[str, Any] = {
         "db_size_mb": 0.0,
         "total_hotspots": 0,
         "total_events": 0,
         "active_events": 0,
-        "environment": os.environ.get("ENVIRONMENT", "dev"),
+        "environment": settings.environment,
     }
 
     # Database file size
-    db_file = Path(db_path)
+    db_file = Path(_db_path)
     if db_file.exists():
-        info["db_size_mb"] = db_file.stat().st_size / (1024 * 1024)
+        info["db_size_mb"] = round(db_file.stat().st_size / (1024 * 1024), 2)
 
-    with Session(engine) as session:
-        info["total_hotspots"] = (
-            session.execute(select(func.count(Hotspot.id))).scalar_one_or_none() or 0
-        )
-        info["total_events"] = (
-            session.execute(select(func.count(FireEvent.id))).scalar_one_or_none() or 0
-        )
-        info["active_events"] = (
-            session.execute(
-                select(func.count(FireEvent.id)).where(FireEvent.is_active.is_(True))
-            ).scalar_one_or_none()
-            or 0
-        )
+    try:
+        with engine.connect() as conn:
+            row_hs = conn.execute(text("SELECT COUNT(*) AS cnt FROM hotspots")).mappings().first()
+            info["total_hotspots"] = row_hs["cnt"] if row_hs else 0
 
-    engine.dispose()
+            row_ev = (
+                conn.execute(text("SELECT COUNT(*) AS cnt FROM fire_events")).mappings().first()
+            )
+            info["total_events"] = row_ev["cnt"] if row_ev else 0
+
+            row_active = (
+                conn.execute(text("SELECT COUNT(*) AS cnt FROM fire_events WHERE is_active = 1"))
+                .mappings()
+                .first()
+            )
+            info["active_events"] = row_active["cnt"] if row_active else 0
+    except Exception:
+        pass
+    finally:
+        engine.dispose()
+
     return info
 
 
 # ---------------------------------------------------------------------------
-# Page rendering
+# Section renderers
 # ---------------------------------------------------------------------------
 
 
 def _render_pipeline_health(pipeline_runs: list[dict[str, Any]]) -> None:
-    """Render the pipeline health section."""
-    st.subheader("Salud del pipeline")
+    """Render Section A: Pipeline Health with status card and runs table."""
+    render_section_header("Salud del Pipeline", "monitor_heart")
 
     if not pipeline_runs:
         st.info("No hay ejecuciones del pipeline registradas.")
         return
 
-    # Last successful run
-    last_success = None
-    for run in pipeline_runs:
-        if run["status"] == "success":
-            last_success = run
-            break
+    # Latest run summary card
+    last_run = pipeline_runs[0]
+    status_key = _STATUS_MAP.get(last_run["status"], "error")
 
-    if last_success:
-        st.success(f"Ultima ejecucion exitosa: {last_success['started_at']}")
+    # Format timestamps
+    started = last_run["started_at"]
+    if isinstance(started, str):
+        started_display = started[:16].replace("T", " ")
+    elif isinstance(started, datetime):
+        started_display = started.strftime("%Y-%m-%d %H:%M")
     else:
-        st.warning("No hay ejecuciones exitosas recientes.")
+        started_display = "N/A"
 
-    # Pipeline runs table
-    rows = []
+    duration_display = (
+        f"{last_run['duration_ms']}ms" if last_run["duration_ms"] is not None else "N/A"
+    )
+
+    # Build summary card HTML
+    status_color = {
+        "online": COLORS["status_online"],
+        "warning": COLORS["status_warning"],
+        "error": COLORS["status_error"],
+    }.get(status_key, COLORS["status_error"])
+
+    summary_html = f"""
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:8px;">
+            <div style="position:relative;width:10px;height:10px;">
+                <div style="position:absolute;inset:0;background:{status_color};
+                    border-radius:50%;"></div>
+                <div style="position:absolute;inset:-2px;background:{status_color};
+                    border-radius:50%;opacity:0.4;
+                    animation:status-pulse 2s ease-in-out infinite;"></div>
+            </div>
+            <span style="font-size:14px;font-weight:600;color:#F1F5F9;">
+                Pipeline {_STATUS_LABELS_ES.get(last_run["status"], last_run["status"]).upper()}
+            </span>
+        </div>
+        <span style="font-size:12px;color:#94A3B8;">
+            Ultima ejecucion: {started_display}
+        </span>
+        <span style="font-size:12px;color:#64748B;">
+            Duracion: {duration_display}
+        </span>
+        <span style="font-size:12px;color:#94A3B8;">
+            Focos: {last_run["hotspots_fetched"]} ({last_run["new_hotspots"]} nuevos)
+        </span>
+    </div>
+    """
+    render_card_container(summary_html, accent=status_color)
+
+    st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
+
+    # Recent pipeline runs table
+    rows_data: list[dict[str, Any]] = []
     for run in pipeline_runs:
-        status_emoji = _STATUS_COLORS.get(run["status"], "\u26aa")
-        duration = f"{run['duration_ms']}ms" if run["duration_ms"] else "N/A"
-        error_count = len(run["errors"]) if run["errors"] else 0
-        error_display = f"{error_count} errores" if error_count > 0 else ""
+        run_started = run["started_at"]
+        if isinstance(run_started, str):
+            fecha = run_started[:16].replace("T", " ")
+        elif isinstance(run_started, datetime):
+            fecha = run_started.strftime("%Y-%m-%d %H:%M")
+        else:
+            fecha = "N/A"
 
-        rows.append(
+        dur = f"{run['duration_ms']}ms" if run["duration_ms"] is not None else "N/A"
+        status_label = _STATUS_LABELS_ES.get(run["status"], run["status"])
+
+        rows_data.append(
             {
-                "Fecha": run["started_at"],
-                "Duracion": duration,
-                "Estado": f"{status_emoji} {run['status'].upper()}",
-                "Hotspots": run["hotspots_fetched"],
+                "Fecha": fecha,
+                "Duracion": dur,
+                "Estado": status_label.upper(),
+                "Focos": run["hotspots_fetched"],
                 "Nuevos": run["new_hotspots"],
-                "Eventos creados": run["events_created"],
+                "Eventos": run["events_created"],
                 "Alertas": run["alerts_sent"],
-                "Errores": error_display,
             }
         )
 
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # Placeholder button for manual run
-    st.button(
-        "Ejecutar ciclo ahora",
-        disabled=True,
-        help="Proximamente: ejecucion manual del pipeline",
-    )
+    if rows_data:
+        df = pd.DataFrame(rows_data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def _render_api_health(pipeline_runs: list[dict[str, Any]]) -> None:
-    """Render API health section based on pipeline run errors."""
-    st.subheader("Estado de APIs externas")
+    """Render Section B: API Health with status cards for each service."""
+    render_section_header("Estado de APIs", "cloud")
 
     data_sources = ["FIRMS", "Open-Meteo", "Overpass"]
 
-    # Check errors across recent runs
+    # Determine status per API based on recent pipeline errors
     source_status: dict[str, str] = {}
+    source_last_ok: dict[str, str] = {}
+
     for source in data_sources:
         has_recent_error = False
+        last_ok_time = ""
         source_lower = source.lower()
+
         for run in pipeline_runs[:5]:
+            # Check if this source had an error
+            run_has_error = False
             for error in run.get("errors", []):
                 if isinstance(error, str) and source_lower in error.lower():
-                    has_recent_error = True
+                    run_has_error = True
                     break
-            if has_recent_error:
-                break
-        source_status[source] = "error" if has_recent_error else "ok"
 
-    cols = st.columns(len(data_sources))
+            if not run_has_error and run["status"] in ("success", "partial"):
+                started = run["started_at"]
+                if isinstance(started, str):
+                    last_ok_time = started[:16].replace("T", " ")
+                elif isinstance(started, datetime):
+                    last_ok_time = started.strftime("%Y-%m-%d %H:%M")
+                break
+
+            if run_has_error:
+                has_recent_error = True
+
+        source_status[source] = "error" if has_recent_error else "online"
+        source_last_ok[source] = last_ok_time or "N/A"
+
+    cols = st.columns(3)
     for i, source in enumerate(data_sources):
         with cols[i]:
             status = source_status[source]
-            if status == "ok":
-                st.success(f"{source}: Operativo")
-            else:
-                st.error(f"{source}: Error reciente")
+            accent = COLORS["status_online"] if status == "online" else COLORS["status_error"]
+            icon = _API_ICONS.get(source, "cloud")
+            status_label = "Operativo" if status == "online" else "Error reciente"
+
+            card_html = f"""
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+                <span class="material-icons-round"
+                      style="font-size:20px;color:{accent};">{icon}</span>
+                <span style="font-size:14px;font-weight:600;color:#F1F5F9;">
+                    {source}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                <div style="position:relative;width:8px;height:8px;">
+                    <div style="position:absolute;inset:0;background:{accent};
+                        border-radius:50%;"></div>
+                    <div style="position:absolute;inset:-2px;background:{accent};
+                        border-radius:50%;opacity:0.4;
+                        animation:status-pulse 2s ease-in-out infinite;"></div>
+                </div>
+                <span style="font-size:12px;color:#94A3B8;">{status_label}</span>
+            </div>
+            <p style="font-size:11px;color:#64748B;margin:0;">
+                Ultimo OK: {source_last_ok[source]}</p>
+            """
+            render_card_container(card_html, accent=accent)
 
 
-def _render_alert_stats(stats: dict[str, Any]) -> None:
-    """Render alert statistics section."""
-    st.subheader("Estadisticas de alertas")
+def _render_alert_stats(alert_stats: dict[str, Any]) -> None:
+    """Render Section C: Alert Statistics with metric cards."""
+    render_section_header("Estadisticas de Alertas", "notifications")
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.metric("Alertas (24h)", stats["total_24h"])
+        render_metric_card(
+            icon="notifications_active",
+            label="Alertas 24h",
+            value=str(alert_stats["total_24h"]),
+            accent=COLORS["fire_warning"],
+        )
 
     with col2:
-        st.metric("Alertas (7 dias)", stats["total_7d"])
+        render_metric_card(
+            icon="date_range",
+            label="Alertas 7d",
+            value=str(alert_stats["total_7d"]),
+            accent=COLORS["fire_high"],
+        )
 
     with col3:
-        st.metric("Tasa de entrega", f"{stats['success_rate']:.1f}%")
+        render_metric_card(
+            icon="verified",
+            label="Tasa de entrega",
+            value=f"{alert_stats['success_rate']:.1f}%",
+            accent=COLORS["status_online"],
+        )
 
     with col4:
-        st.metric("Suscripciones activas", stats["active_subscriptions"])
-
-    # Channel breakdown
-    by_channel = stats.get("by_channel", {})
-    if by_channel:
-        st.markdown("**Alertas por canal (ultimos 7 dias):**")
-        channel_rows = []
-        for channel, count in by_channel.items():
-            channel_display = {
-                "telegram": "Telegram",
-                "whatsapp": "WhatsApp",
-                "email": "Email",
-            }.get(channel, channel)
-            channel_rows.append({"Canal": channel_display, "Cantidad": count})
-        df = pd.DataFrame(channel_rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No hay alertas enviadas en los ultimos 7 dias.")
+        render_metric_card(
+            icon="people",
+            label="Suscripciones activas",
+            value=str(alert_stats["active_subscriptions"]),
+            accent=COLORS["severity_low"],
+        )
 
 
-def _render_system_info(info: dict[str, Any]) -> None:
-    """Render system information section."""
-    st.subheader("Informacion del sistema")
+def _render_system_info(system_info: dict[str, Any]) -> None:
+    """Render Section D: System Information with KPI row."""
+    render_section_header("Sistema", "storage")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    env_display = {
+        "dev": "Desarrollo",
+        "staging": "Staging",
+        "prod": "Produccion",
+    }.get(system_info["environment"], system_info["environment"])
 
-    with col1:
-        st.metric("Base de datos", f"{info['db_size_mb']:.2f} MB")
+    render_kpi_row(
+        [
+            {
+                "label": "Base de datos",
+                "value": f"{system_info['db_size_mb']:.2f} MB",
+                "icon": "storage",
+                "color": COLORS["text_accent"],
+            },
+            {
+                "label": "Total hotspots",
+                "value": f"{system_info['total_hotspots']:,}",
+                "icon": "whatshot",
+                "color": COLORS["fire_high"],
+            },
+            {
+                "label": "Total eventos",
+                "value": f"{system_info['total_events']:,}",
+                "icon": "layers",
+                "color": COLORS["fire_warning"],
+            },
+            {
+                "label": "Eventos activos",
+                "value": str(system_info["active_events"]),
+                "icon": "local_fire_department",
+                "color": COLORS["fire_critical"],
+            },
+            {
+                "label": "Entorno",
+                "value": env_display,
+                "icon": "dns",
+                "color": COLORS["text_secondary"],
+            },
+        ]
+    )
 
-    with col2:
-        st.metric("Total hotspots", info["total_hotspots"])
 
-    with col3:
-        st.metric("Total eventos", info["total_events"])
-
-    with col4:
-        st.metric("Eventos activos", info["active_events"])
-
-    with col5:
-        env_display = {
-            "dev": "Desarrollo",
-            "staging": "Staging",
-            "prod": "Produccion",
-        }.get(info["environment"], info["environment"])
-        st.metric("Entorno", env_display)
+# ---------------------------------------------------------------------------
+# Main page render
+# ---------------------------------------------------------------------------
 
 
-def render_admin_page(db_url: str, db_path: str) -> None:
-    """Render the admin panel page.
+def render_admin_page() -> None:
+    """Render the admin panel page with authentication gate.
 
-    Args:
-        db_url: SQLAlchemy database URL string.
-        db_path: Path to the SQLite database file.
+    Uses get_settings() for admin password and database path.
+    All data queries are cached with a 5-minute TTL.
     """
-    st.title("Panel de administracion")
-
     # Authentication gate
-    if not _check_admin_auth():
+    if not _render_login_form():
         return
 
-    # Logout button
-    if st.button("Cerrar sesion"):
-        st.session_state["admin_authenticated"] = False
-        st.rerun()
+    # Logout button (top-right aligned)
+    _cols_top = st.columns([8, 1])
+    with _cols_top[1]:
+        if st.button("Cerrar sesion", key="admin_logout"):
+            st.session_state["admin_authenticated"] = False
+            st.rerun()
 
-    st.divider()
+    # Build database URL
+    settings = get_settings()
+    db_url = f"sqlite:///{settings.db_path}"
+    db_path = settings.db_path
 
-    # Pipeline health
-    pipeline_runs = get_pipeline_runs(_db_url=db_url)
+    # Fetch all data
+    pipeline_runs = _get_pipeline_runs(_db_url=db_url)
+    alert_stats = _get_alert_stats(_db_url=db_url)
+    system_info = _get_system_info(_db_url=db_url, _db_path=db_path)
+
+    # Section A: Pipeline Health
     _render_pipeline_health(pipeline_runs)
 
-    st.divider()
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
-    # API health
+    # Section B: API Health
     _render_api_health(pipeline_runs)
 
-    st.divider()
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
-    # Alert stats
-    alert_stats = get_alert_stats(_db_url=db_url)
+    # Section C: Alert Statistics
     _render_alert_stats(alert_stats)
 
-    st.divider()
+    st.markdown('<div style="height:8px;"></div>', unsafe_allow_html=True)
 
-    # System info
-    system_info = get_system_info(_db_url=db_url, db_path=db_path)
+    # Section D: System Information
     _render_system_info(system_info)
