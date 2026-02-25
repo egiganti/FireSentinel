@@ -30,6 +30,7 @@ class MonitoringConfig(BaseModel):
     """Top-level monitoring configuration."""
 
     poll_interval_minutes: int
+    day_range: int = 2
     sources: list[str]
     bbox: BBoxConfig
 

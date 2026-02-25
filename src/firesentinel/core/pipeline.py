@@ -122,7 +122,10 @@ class Pipeline:
         # -----------------------------------------------------------------
         try:
             bbox = self._yaml_config.monitoring.bbox.full_patagonia
-            raw_hotspots = await self._firms.fetch_all_sources(bbox=bbox)
+            day_range = self._yaml_config.monitoring.day_range
+            raw_hotspots = await self._firms.fetch_all_sources(
+                bbox=bbox, day_range=day_range
+            )
             record.hotspots_fetched = len(raw_hotspots)
             logger.info(
                 "Stage 1 INGEST: Fetched %d hotspots from FIRMS sources",

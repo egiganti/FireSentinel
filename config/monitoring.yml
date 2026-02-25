@@ -1,5 +1,6 @@
 monitoring:
   poll_interval_minutes: 15
+  day_range: 2
   sources:
     - VIIRS_SNPP_NRT
     - VIIRS_NOAA20_NRT

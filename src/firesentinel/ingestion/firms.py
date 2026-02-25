@@ -37,8 +37,15 @@ _BACKOFF_MAX_RETRIES = 3
 # VIIRS sources share the same CSV column layout
 _VIIRS_SOURCES = {Source.VIIRS_SNPP_NRT, Source.VIIRS_NOAA20_NRT, Source.VIIRS_NOAA21_NRT}
 
-# Acceptable VIIRS confidence levels (case-insensitive)
+# Acceptable VIIRS confidence levels (case-insensitive, full-word form)
 _VIIRS_VALID_CONFIDENCE = {"nominal", "high"}
+
+# FIRMS CSV uses single-letter codes; map to canonical full-word form
+_VIIRS_CONFIDENCE_MAP: dict[str, str] = {
+    "l": "low",
+    "n": "nominal",
+    "h": "high",
+}
 
 # Minimum MODIS confidence value (integer percentage)
 _MODIS_MIN_CONFIDENCE = 30
@@ -239,10 +246,12 @@ class FIRMSClient:
         Returns None if the row fails confidence or brightness filters.
         """
         # Extract confidence and apply filter
-        confidence_raw = row["confidence"].strip()
+        confidence_raw = row["confidence"].strip().lower()
 
         if is_viirs:
-            if confidence_raw.lower() not in _VIIRS_VALID_CONFIDENCE:
+            # Normalize single-letter FIRMS codes (l/n/h) to full words
+            confidence_raw = _VIIRS_CONFIDENCE_MAP.get(confidence_raw, confidence_raw)
+            if confidence_raw not in _VIIRS_VALID_CONFIDENCE:
                 return None
         else:
             # MODIS confidence is an integer percentage

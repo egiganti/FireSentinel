@@ -157,6 +157,26 @@ async def test_fetch_filters_low_confidence(client: FIRMSClient) -> None:
 
 
 @respx.mock
+async def test_fetch_handles_single_letter_confidence_codes(client: FIRMSClient) -> None:
+    """FIRMS CSV returns single-letter codes (l/n/h) which must be normalized."""
+    csv_body = _build_viirs_csv(
+        _viirs_row(confidence="l", bright_ti4=350.0),
+        _viirs_row(confidence="n", bright_ti4=350.0),
+        _viirs_row(confidence="h", bright_ti4=350.0),
+    )
+
+    url = f"{_BASE}/{_MAP_KEY}/VIIRS_SNPP_NRT/{_BBOX_STR}/1"
+    respx.get(url).mock(return_value=Response(200, text=csv_body))
+
+    hotspots = await client.fetch_hotspots(Source.VIIRS_SNPP_NRT, _BBOX)
+
+    assert len(hotspots) == 2
+    confidences = {h.confidence for h in hotspots}
+    assert "l" not in confidences and "low" not in confidences
+    assert confidences == {"nominal", "high"}
+
+
+@respx.mock
 async def test_fetch_filters_low_brightness(client: FIRMSClient) -> None:
     """Dim hotspots (brightness <= 300K) are filtered out."""
     csv_body = _build_viirs_csv(
