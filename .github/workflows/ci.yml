@@ -1,0 +1,304 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "1.8.5"
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Stage 1: Code Quality (fast, runs first)
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff lint
+        run: ruff check src/ tests/
+
+      - name: Ruff format check
+        run: ruff format --check src/ tests/
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: pip install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry/virtualenvs
+          key: poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Mypy strict type check
+        run: poetry run mypy src/
+
+  # ──────────────────────────────────────────────
+  # Stage 2: Security Scanning
+  # ──────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: pip install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Install security tools
+        run: poetry run pip install bandit pip-audit
+
+      - name: Bandit security linter
+        run: poetry run bandit -r src/ -c pyproject.toml -f json -o bandit-report.json || true
+
+      - name: Bandit human-readable output
+        run: poetry run bandit -r src/ -c pyproject.toml -ll
+
+      - name: Pip-audit dependency vulnerabilities
+        run: poetry run pip-audit --strict --desc
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "Scanning for potential hardcoded secrets..."
+          # Check for common secret patterns in Python files
+          FOUND=0
+          for pattern in \
+            'API_KEY\s*=\s*["\x27][A-Za-z0-9]' \
+            'SECRET\s*=\s*["\x27][A-Za-z0-9]' \
+            'TOKEN\s*=\s*["\x27][A-Za-z0-9]' \
+            'PASSWORD\s*=\s*["\x27][A-Za-z0-9]' \
+            'map_key\s*=\s*["\x27][A-Za-z0-9]{10,}'; do
+            if grep -rn --include="*.py" -E "$pattern" src/ tests/ 2>/dev/null | grep -v '\.example' | grep -v 'test_' | grep -v '# nosec' | grep -v 'env\.' | grep -v 'os\.environ' | grep -v 'getenv'; then
+              echo "WARNING: Possible hardcoded secret found"
+              FOUND=1
+            fi
+          done
+          if [ $FOUND -eq 1 ]; then
+            echo "::warning::Potential hardcoded secrets detected. Please review."
+          else
+            echo "No hardcoded secrets found."
+          fi
+
+      - name: Check for dangerous imports
+        run: |
+          echo "Checking for dangerous patterns..."
+          ISSUES=0
+          # Check for subprocess with shell=True
+          if grep -rn 'shell=True' src/; then
+            echo "::error::Found shell=True in subprocess call"
+            ISSUES=1
+          fi
+          # Check for eval/exec
+          if grep -rn -E '\b(eval|exec)\s*\(' src/ | grep -v '# nosec'; then
+            echo "::error::Found eval() or exec() call"
+            ISSUES=1
+          fi
+          # Check for pickle (deserialization risk)
+          if grep -rn 'import pickle' src/; then
+            echo "::error::Found pickle import (deserialization risk)"
+            ISSUES=1
+          fi
+          if [ $ISSUES -eq 1 ]; then
+            exit 1
+          fi
+          echo "No dangerous patterns found."
+
+      - name: Upload Bandit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Stage 3: Tests
+  # ──────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: pip install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry/virtualenvs
+          key: poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: poetry-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Run tests with coverage
+        run: poetry run pytest tests/ -x -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Stage 4: Product Validation
+  # ──────────────────────────────────────────────
+  product-check:
+    name: Product Validation
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: pip install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Verify package imports
+        run: |
+          poetry run python -c "
+          from firesentinel.core.types import (
+              Source, Confidence, DayNight, Severity, IntentLabel,
+              AlertChannel, RawHotspot, WeatherContext, RoadContext,
+              EnrichedHotspot, IntentBreakdown, FireEvent
+          )
+          print('All core types import successfully')
+          "
+
+      - name: Verify config loads
+        env:
+          FIRMS_MAP_KEY: test_key_for_ci
+        run: |
+          poetry run python -c "
+          from firesentinel.config import get_settings, get_yaml_config
+          settings = get_settings()
+          assert settings.FIRMS_MAP_KEY == 'test_key_for_ci'
+          config = get_yaml_config()
+          assert config.monitoring is not None
+          assert config.intent_scoring is not None
+          assert len(config.zones) >= 9
+          print(f'Config loaded: {len(config.zones)} zones, poll interval {config.monitoring.poll_interval_minutes}min')
+          "
+
+      - name: Verify DB models
+        run: |
+          poetry run python -c "
+          from firesentinel.db.models import (
+              Hotspot, FireEvent, AlertSubscription, AlertSent,
+              ExclusionZone, PipelineRun
+          )
+          print(f'All 6 DB models import successfully')
+          "
+
+      - name: Verify monitoring zones match PRD
+        run: |
+          poetry run python -c "
+          from firesentinel.config import get_yaml_config
+          config = get_yaml_config()
+          required_zones = ['epuyen', 'cholila', 'el_hoyo', 'el_bolson', 'los_alerces', 'lago_puelo', 'bariloche', 'esquel', 'all_patagonia']
+          zone_ids = [z.id for z in config.zones]
+          missing = [z for z in required_zones if z not in zone_ids]
+          assert not missing, f'Missing zones from PRD: {missing}'
+          print(f'All {len(required_zones)} PRD-defined zones present')
+          "
+
+      - name: Verify intent scoring weights sum to 100
+        run: |
+          poetry run python -c "
+          from firesentinel.config import get_yaml_config
+          config = get_yaml_config()
+          w = config.intent_scoring.weights
+          total = w.lightning_absence + w.road_proximity + w.nighttime_ignition + w.historical_repeat + w.multi_point_ignition + w.dry_conditions
+          assert total == 100, f'Weights sum to {total}, expected 100'
+          print(f'Intent scoring weights valid: {total}/100')
+          "
+
+      - name: Verify required docs exist
+        run: |
+          for doc in docs/PRD.md docs/BUILD_PLAN.md CLAUDE.md README.md .env.example; do
+            if [ ! -f "$doc" ]; then
+              echo "::error::Missing required document: $doc"
+              exit 1
+            fi
+            echo "Found: $doc"
+          done
+          echo "All required docs present"
+
+  # ──────────────────────────────────────────────
+  # Gate: All checks must pass
+  # ──────────────────────────────────────────────
+  gate:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, security, test, product-check]
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Type Check: ${{ needs.typecheck.result }}"
+          echo "Security: ${{ needs.security.result }}"
+          echo "Tests: ${{ needs.test.result }}"
+          echo "Product: ${{ needs.product-check.result }}"
+
+          if [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.typecheck.result }}" != "success" ] || \
+             [ "${{ needs.security.result }}" != "success" ] || \
+             [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.product-check.result }}" != "success" ]; then
+            echo "::error::One or more required checks failed"
+            exit 1
+          fi
+          echo "All gates passed. Ready to deploy."
