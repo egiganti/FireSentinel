@@ -1,0 +1,27 @@
+[Unit]
+Description=FireSentinel Patagonia - Wildfire Detection Pipeline
+After=network.target
+Documentation=https://github.com/egiganti/FireSentinel
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/FireSentinel
+Environment=FIRMS_MAP_KEY=
+Environment=TELEGRAM_BOT_TOKEN=
+Environment=ADMIN_PASSWORD=
+Environment=ENVIRONMENT=prod
+Environment=DB_PATH=/root/FireSentinel/data/firesentinel.db
+ExecStart=/root/.local/bin/poetry run python -m firesentinel.main
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root/FireSentinel/data
+
+[Install]
+WantedBy=multi-user.target
