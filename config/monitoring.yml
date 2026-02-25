@@ -1,0 +1,87 @@
+monitoring:
+  poll_interval_minutes: 15
+  sources:
+    - VIIRS_SNPP_NRT
+    - VIIRS_NOAA20_NRT
+    - VIIRS_NOAA21_NRT
+    - MODIS_NRT
+  bbox:
+    full_patagonia: [-74, -50, -65, -38]
+    crisis_corridor: [-72.1, -43.0, -71.2, -41.8]
+
+intent_scoring:
+  weights:
+    lightning_absence: 25
+    road_proximity: 20
+    nighttime_ignition: 20
+    historical_repeat: 15
+    multi_point_ignition: 10
+    dry_conditions: 10
+  thresholds:
+    natural: [0, 25]
+    uncertain: [26, 50]
+    suspicious: [51, 75]
+    likely_intentional: [76, 100]
+  road_distance_m:
+    very_close: 200
+    close: 500
+    near: 1000
+    moderate: 2000
+  night_hours_local:
+    peak: [22, 5]
+    shoulder: [5, 7]
+    shoulder_evening: [20, 22]
+
+zones:
+  epuyen:
+    center: [-42.22, -71.43]
+    radius_km: 15
+  cholila:
+    center: [-42.52, -71.45]
+    radius_km: 15
+  el_hoyo:
+    center: [-42.07, -71.52]
+    radius_km: 10
+  el_bolson:
+    center: [-41.96, -71.53]
+    radius_km: 15
+  los_alerces:
+    center: [-42.80, -71.89]
+    radius_km: 30
+  lago_puelo:
+    center: [-42.10, -71.60]
+    radius_km: 15
+  bariloche:
+    center: [-41.13, -71.31]
+    radius_km: 25
+  esquel:
+    center: [-42.91, -71.32]
+    radius_km: 15
+  all_patagonia:
+    center: [-44.00, -69.50]
+    radius_km: 500
+
+clustering:
+  spatial_radius_m: 1000
+  temporal_window_hours: 2
+  severity:
+    low: [1, 2]
+    medium: [3, 5]
+    high: [6, 9]
+    critical: [10, null]
+  critical_frp_threshold_mw: 100
+
+dedup:
+  spatial_tolerance_m: 750
+  temporal_tolerance_minutes: 30
+
+alerts:
+  max_per_event_per_user: 3
+  cooldown_hours: 6
+  min_severity_default: medium
+
+caching:
+  weather_grid_degrees: 0.25
+  weather_ttl_minutes: 60
+  roads_grid_degrees: 0.1
+  roads_ttl_hours: 24

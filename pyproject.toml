@@ -1,0 +1,54 @@
+[tool.poetry]
+name = "firesentinel"
+version = "0.1.0"
+description = "Satellite-based wildfire detection and intentionality analysis platform for Argentine Patagonia"
+authors = ["Ezequiel Giganti"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "firesentinel", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+httpx = "^0.28"
+sqlalchemy = {version = "^2.0", extras = ["asyncio"]}
+aiosqlite = "^0.21"
+geopandas = "^1.0"
+shapely = "^2.0"
+folium = "^0.19"
+streamlit = "^1.42"
+python-telegram-bot = "^21"
+twilio = "^9"
+pydantic = "^2.10"
+pydantic-settings = "^2.7"
+apscheduler = "^3.11"
+pyyaml = "^6.0"
+greenlet = "^3.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+pytest-asyncio = "^0.25"
+pytest-httpx = "^0.35"
+mypy = "^1.14"
+ruff = "^0.9"
+respx = "^0.22"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
